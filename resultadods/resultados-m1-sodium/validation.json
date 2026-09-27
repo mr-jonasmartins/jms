@@ -1,0 +1,10 @@
+[
+  "6 known-answer checks embedded in jms.c",
+  "PBKDF2 vs hashlib at 1, 2 and 4096 iterations",
+  "13 round trips: 0..1 MiB, block and I/O buffer boundaries, mode 0600, 56-byte overhead",
+  "Wrong password rejected without output",
+  "23 corruption/truncation/append cases rejected without output",
+  "Existing destination and destination symlink preserved",
+  "Same input/output rejected; fresh salt/nonce on repeated encryption",
+  "libsodium AEAD ciphertext/tag vs JMS, 1 MiB, outside timing"
+]

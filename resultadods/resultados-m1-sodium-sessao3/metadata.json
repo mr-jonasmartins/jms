@@ -1,0 +1,82 @@
+{
+  "date_utc": "2026-09-26T22:22:55Z",
+  "profile": "article",
+  "platform": "macOS-27.0-arm64-arm-64bit",
+  "machine": "arm64",
+  "cpu": "Apple M1",
+  "ram_bytes": 8589934592,
+  "python": "3.9.6 (default, Aug 25 2026, 21:26:21) \n[Clang 21.0.0 (clang-2100.3.34.2)]",
+  "compiler_version": "Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin",
+  "flags": [
+    "-std=c99",
+    "-O2",
+    "-Wall",
+    "-Wextra",
+    "-Wpedantic",
+    "-Werror"
+  ],
+  "builds": [
+    [
+      "cc",
+      "-std=c99",
+      "-O2",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-Werror",
+      "/Users/jonas/Downloads/novos/labs/lab-criptografia/jms-academico/jms.c",
+      "-o",
+      "/Users/jonas/Downloads/novos/labs/lab-criptografia/jms-academico/resultados-m1-sodium-sessao3/jms"
+    ],
+    [
+      "cc",
+      "-std=c99",
+      "-O2",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-Werror",
+      "/Users/jonas/Downloads/novos/labs/lab-criptografia/jms-academico/bench_driver.c",
+      "-o",
+      "/Users/jonas/Downloads/novos/labs/lab-criptografia/jms-academico/resultados-m1-sodium-sessao3/bench_driver",
+      "-DJMS_HAVE_SODIUM",
+      "-I/opt/homebrew/Cellar/libsodium/1.0.22/include",
+      "-L/opt/homebrew/Cellar/libsodium/1.0.22/lib",
+      "-Wl,-rpath,/opt/homebrew/Cellar/libsodium/1.0.22/lib",
+      "-lsodium"
+    ],
+    [
+      "cc",
+      "-std=c99",
+      "-O2",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-Werror",
+      "/Users/jonas/Downloads/novos/labs/lab-criptografia/jms-academico/measure.c",
+      "-o",
+      "/Users/jonas/Downloads/novos/labs/lab-criptografia/jms-academico/resultados-m1-sodium-sessao3/measure"
+    ]
+  ],
+  "source_sha256": "22c73a2dc15f39239d455c08401e2481dc82fe3d29a3028d7847a1d13fe39c0f",
+  "harness_sha256": "67052495acd338b4d0c7b9e58490bbe81eb13d45cf0d97460b66e5f1a61d4816",
+  "collector_sha256": "7b28ad99dfa78c7b3d35a281040152b9f852ed86212d16bc4410dc43eb27a6ae",
+  "script_sha256": "f59b33a7cc502642b961a4ccba231828130b08a719a6fd9c5bf140ea0b01ac69",
+  "source_bytes": 29367,
+  "source_lines": 786,
+  "binary_bytes": 52304,
+  "binary_sha256": "72d69afd1f64af95aa4244dd3e20ab3e0a28d84090a2ceb416867c122a2264eb",
+  "driver_bytes": 53104,
+  "repeats": 7,
+  "warmups": 1,
+  "seed": 20260928,
+  "sodium_enabled": true,
+  "disk": {
+    "total": 245107195904,
+    "used": 149587333120,
+    "free": 95519862784
+  },
+  "dependencies": "/Users/jonas/Downloads/novos/labs/lab-criptografia/jms-academico/resultados-m1-sodium-sessao3/jms:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.0.0)",
+  "driver_dependencies": "/Users/jonas/Downloads/novos/labs/lab-criptografia/jms-academico/resultados-m1-sodium-sessao3/bench_driver:\n\t/opt/homebrew/opt/libsodium/lib/libsodium.26.dylib (compatibility version 31.0.0, current version 31.0.0)\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1359.0.0)",
+  "sodium_version_header": "\n#ifndef sodium_version_H\n#define sodium_version_H\n\n#include \"export.h\"\n\n#define SODIUM_VERSION_STRING \"1.0.22\"\n\n#define SODIUM_LIBRARY_VERSION_MAJOR 26\n#define SODIUM_LIBRARY_VERSION_MINOR 4\n\n\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\nSODIUM_EXPORT\nconst char *sodium_version_string(void);\n\nSODIUM_EXPORT\nint         sodium_library_version_major(void);\n\nSODIUM_EXPORT\nint         sodium_library_version_minor(void);\n\nSODIUM_EXPORT\nint         sodium_library_minimal(void);\n\n#ifdef __cplusplus\n}\n#endif\n\n#endif\n"
+}

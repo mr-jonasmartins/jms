@@ -1,68 +1,41 @@
-#ifdef _WIN32
-#define _CRT_RAND_S
-#include <windows.h>
-#define SECURE_ZERO(ptr, size) SecureZeroMemory((ptr), (size))
-#else
-#include <stddef.h>
+/* JMS 3.0 research artifact — C99 core, POSIX macOS/Linux shell.
+ * PBKDF2-HMAC-SHA256 (RFC 8018), ChaCha20-Poly1305 (RFC 8439).
+ * Based in part on the author's JMS 2 SHA-256/ChaCha20 implementation.
+ * No third-party cryptographic dependencies. Not independently audited.
+ * Format JMS3 is incompatible with JMS2. Never overwrites an existing path.
+ * Build: cc -std=c99 -O2 -Wall -Wextra -Wpedantic jms.c -o jms
+ */
+#define _POSIX_C_SOURCE 200809L
+#define _FILE_OFFSET_BITS 64
 #include <stdint.h>
-/* Implementação universal segura para macOS e Linux */
-static void secure_memzero(void *ptr, size_t len) {
-    volatile uint8_t *p = (volatile uint8_t *)ptr;
-    while (len--) {
-        *p++ = 0;
-    }
-}
-#define SECURE_ZERO(ptr, size) secure_memzero((ptr), (size))
-#endif
-
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <termios.h>
+#include <signal.h>
+#include <sys/stat.h>
 
-/*
- * JMS (Just Message Security) v2.0 - Criptografia de arquivos em C.
- *
- * Interface de linha de comando (mantida simples):
- * Criptografar:   jms -f <arquivo_entrada> -c <chave> -o <arquivo_saida>
- * Descriptografar: jms -f <arquivo_entrada> -d <chave> -o <arquivo_saida>
- *
- * Estrategia criptografica adotada:
- * 1) Derivacao de chave a partir da senha (KDF iterativo com SHA-256 + salt).
- * 2) Cifragem de dados com ChaCha20.
- * 3) Autenticacao com HMAC-SHA256 sobre cabecalho (sem MAC) + ciphertext.
- *
- * Propriedades:
- * - Chave/senha errada causa falha de autenticacao.
- * - Arquivo adulterado causa falha de autenticacao.
- * - Arquivo invalido (cabecalho incorreto) e rejeitado antes da decriptacao.
- */
-
-#define JMS_VERSION 1u
-#define JMS_SALT_SIZE 16u
-#define JMS_NONCE_SIZE 12u
 #define JMS_KEY_SIZE 32u
-#define JMS_MAC_SIZE 32u
-#define JMS_BUFFER_SIZE 4096u
-#define JMS_KDF_ITERATIONS 200000u
+#define JMS_NONCE_SIZE 12u
+#define JMS_DEFAULT_ITERATIONS 600000u
+#define JMS_MIN_ITERATIONS 100000u
+#define JMS_MAX_ITERATIONS 5000000u
+#define JMS_MAX_BYTES UINT64_C(274877906880)
+#define JMS_BUFFER_SIZE 65536u
+#define JMS_PASSWORD_SIZE 256u
+#define JMS_AAD_SIZE 40u
+#define JMS_HEADER_SIZE 56u
 
-/*
- * Layout do cabecalho JMS2 (em bytes):
- * magic[4]   : assinatura fixa "JMS2"
- * version[1] : versao do formato
- * salt[16]   : salt aleatorio para derivacao de chave
- * nonce[12]  : nonce do ChaCha20
- * iter[4]    : iteracoes da KDF (little-endian)
- * mac[32]    : HMAC-SHA256 do cabecalho (sem mac) + ciphertext
- */
-
-typedef struct {
-    uint8_t magic[4];
-    uint8_t version;
-    uint8_t salt[JMS_SALT_SIZE];
-    uint8_t nonce[JMS_NONCE_SIZE];
-    uint32_t iterations;
-    uint8_t mac[JMS_MAC_SIZE];
-} jms_header_t;
+/* Volatile stores address DSE for this buffer; not register/swap erasure. */
+static void secure_memzero(void *ptr, size_t n) {
+    volatile uint8_t *p = (volatile uint8_t *)ptr;
+    while (n--) *p++ = 0;
+}
+#define SECURE_ZERO(p,n) secure_memzero((p),(n))
 
 /* Contexto incremental de SHA-256. */
 
@@ -85,12 +58,11 @@ typedef struct {
 typedef struct {
     uint8_t key[JMS_KEY_SIZE];
     uint8_t nonce[JMS_NONCE_SIZE];
-    uint32_t counter;
+    uint64_t counter;
     uint8_t keystream[64];
     size_t keystream_offset;
 } chacha20_ctx_t;
 
-static const uint8_t JMS_MAGIC[4] = {'J', 'M', 'S', '2'};
 static const uint32_t SHA256_K[64] = {
     0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
     0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
@@ -131,46 +103,6 @@ static void store_le32(uint8_t *p, uint32_t v) {
     p[2] = (uint8_t)((v >> 16) & 0xFFu);
     p[3] = (uint8_t)((v >> 24) & 0xFFu);
 }
-
-/*
- * Gera bytes aleatorios a partir de /dev/urandom.
- * Retorna 1 em sucesso e 0 em falha.
- */
-
-static int secure_random_bytes(uint8_t *out, size_t len) {
-#ifdef _WIN32
-    size_t produced = 0;
-    while (produced < len) {
-        unsigned int value = 0;
-        if (rand_s(&value) != 0) {
-            return 0;
-        }
-
-        for (size_t i = 0; i < sizeof(value) && produced < len; ++i) {
-            out[produced++] = (uint8_t)((value >> (i * 8u)) & 0xFFu);
-        }
-    }
-    return 1;
-#else
-    FILE *f = fopen("/dev/urandom", "rb");
-    if (!f) {
-        return 0;
-    }
-
-    if (fread(out, 1, len, f) != len) {
-        fclose(f);
-        return 0;
-    }
-
-    fclose(f);
-    return 1;
-#endif
-}
-
-/*
- * Processa um bloco de 512 bits do SHA-256.
- * Funcao central de compressao do algoritmo.
- */
 
 static void sha256_transform(sha256_ctx_t *ctx, const uint8_t data[64]) {
     uint32_t m[64];
@@ -225,6 +157,7 @@ static void sha256_transform(sha256_ctx_t *ctx, const uint8_t data[64]) {
     ctx->state[5] += f;
     ctx->state[6] += g;
     ctx->state[7] += h;
+    SECURE_ZERO(m, sizeof(m));
 }
 
 /* Inicializa estado do SHA-256. */
@@ -304,6 +237,7 @@ static void sha256_once(const uint8_t *data, size_t len, uint8_t out[32]) {
     sha256_init(&ctx);
     sha256_update(&ctx, data, len);
     sha256_final(&ctx, out);
+    SECURE_ZERO(&ctx, sizeof(ctx));
 }
 
 /*
@@ -335,6 +269,10 @@ static void hmac_sha256_init(hmac_sha256_ctx_t *ctx, const uint8_t *key, size_t 
 
     sha256_init(&ctx->outer);
     sha256_update(&ctx->outer, opad, sizeof(opad));
+    SECURE_ZERO(key_block, sizeof(key_block));
+    SECURE_ZERO(temp_hash, sizeof(temp_hash));
+    SECURE_ZERO(ipad, sizeof(ipad));
+    SECURE_ZERO(opad, sizeof(opad));
 }
 
 /* Alimenta dados no HMAC-SHA256. */
@@ -350,6 +288,8 @@ static void hmac_sha256_final(hmac_sha256_ctx_t *ctx, uint8_t mac[32]) {
     sha256_final(&ctx->inner, inner_hash);
     sha256_update(&ctx->outer, inner_hash, sizeof(inner_hash));
     sha256_final(&ctx->outer, mac);
+    SECURE_ZERO(inner_hash, sizeof(inner_hash));
+    SECURE_ZERO(ctx, sizeof(*ctx));
 }
 
 /*
@@ -414,6 +354,8 @@ static void chacha20_block(const uint8_t key[32], uint32_t counter, const uint8_
         working[i] += state[i];
         store_le32(out + (size_t)i * 4u, working[i]);
     }
+    SECURE_ZERO(state, sizeof(state));
+    SECURE_ZERO(working, sizeof(working));
 }
 
 /* Inicializa contexto ChaCha20 (contador inicia em 1). */
@@ -430,398 +372,415 @@ static void chacha20_init(chacha20_ctx_t *ctx, const uint8_t key[32], const uint
 static void chacha20_xor(chacha20_ctx_t *ctx, uint8_t *data, size_t len) {
     for (size_t i = 0; i < len; ++i) {
         if (ctx->keystream_offset >= 64u) {
-            chacha20_block(ctx->key, ctx->counter++, ctx->nonce, ctx->keystream);
+            chacha20_block(ctx->key, (uint32_t)ctx->counter++, ctx->nonce, ctx->keystream);
             ctx->keystream_offset = 0u;
         }
         data[i] ^= ctx->keystream[ctx->keystream_offset++];
     }
 }
 
-/*
- * Deriva chave mestra de 32 bytes a partir de senha + salt.
- * Implementacao iterativa para elevar custo de brute force.
- */
-
-static void derive_master_key(const char *password, const uint8_t salt[JMS_SALT_SIZE], uint32_t iterations, uint8_t out[32]) {
-    const size_t pass_len = strlen(password);
-    uint8_t digest[32];
-    uint8_t iter_le[4];
-    sha256_ctx_t ctx;
-
-    sha256_init(&ctx);
-    sha256_update(&ctx, (const uint8_t *)password, pass_len);
-    sha256_update(&ctx, salt, JMS_SALT_SIZE);
-    sha256_final(&ctx, digest);
-
+/* PBKDF2 specialized to the 32-byte JMS key (one output block).
+ * Precomputed HMAC inner/outer states avoid hashing the pads per iteration. */
+static int pbkdf2(const uint8_t *pw, size_t plen, const uint8_t *salt,
+                  size_t slen, uint32_t iterations, uint8_t out[32]) {
+    hmac_sha256_ctx_t base, work;
+    uint8_t u[32], block[4] = {0, 0, 0, 1};
+    if (!iterations) return 0;
+    hmac_sha256_init(&base, pw, plen);
+    work = base;
+    hmac_sha256_update(&work, salt, slen);
+    hmac_sha256_update(&work, block, sizeof(block));
+    hmac_sha256_final(&work, u);
+    memcpy(out, u, 32);
     for (uint32_t i = 1; i < iterations; ++i) {
-        store_le32(iter_le, i);
-        sha256_init(&ctx);
-        sha256_update(&ctx, digest, sizeof(digest));
-        sha256_update(&ctx, (const uint8_t *)password, pass_len);
-        sha256_update(&ctx, salt, JMS_SALT_SIZE);
-        sha256_update(&ctx, iter_le, sizeof(iter_le));
-        sha256_final(&ctx, digest);
+        work = base;
+        hmac_sha256_update(&work, u, 32);
+        hmac_sha256_final(&work, u);
+        for (size_t j = 0; j < 32; ++j) out[j] ^= u[j];
     }
-
-    memcpy(out, digest, 32);
+    SECURE_ZERO(&base, sizeof(base));
+    SECURE_ZERO(&work, sizeof(work));
+    SECURE_ZERO(u, sizeof(u));
+    return 1;
 }
 
-/*
- * Deriva subchaves especificas por rotulo a partir da chave mestra.
- * Ex.: "JMS-ENC" para cifra e "JMS-MAC" para autenticacao.
- */
+/* Poly1305: five base-2^26 limbs, uint64_t products, modulo 2^130-5.
+ * The reduction and final selection do not branch on secret limb values. */
+typedef struct {
+    uint32_t r[5], h[5], pad[4];
+    uint8_t buffer[16];
+    size_t used;
+} poly_ctx;
 
-static void derive_subkey(const uint8_t master[32], const char *label, uint8_t out[32]) {
-    sha256_ctx_t ctx;
-    sha256_init(&ctx);
-    sha256_update(&ctx, master, 32);
-    sha256_update(&ctx, (const uint8_t *)label, strlen(label));
-    sha256_final(&ctx, out);
+static void poly_init(poly_ctx *p, const uint8_t key[32]) {
+    memset(p, 0, sizeof(*p));
+    p->r[0] = load_le32(key) & 0x3ffffffu;
+    p->r[1] = (load_le32(key+3) >> 2) & 0x3ffff03u;
+    p->r[2] = (load_le32(key+6) >> 4) & 0x3ffc0ffu;
+    p->r[3] = (load_le32(key+9) >> 6) & 0x3f03fffu;
+    p->r[4] = (load_le32(key+12) >> 8) & 0x00fffffu;
+    for (size_t i=0; i<4; ++i) p->pad[i] = load_le32(key+16+4*i);
 }
-
-/* Utilitarios de leitura/escrita de inteiro little-endian em arquivo. */
-
-static int write_u32_le_file(FILE *f, uint32_t v) {
-    uint8_t b[4];
-    store_le32(b, v);
-    return fwrite(b, 1, sizeof(b), f) == sizeof(b);
-}
-
-static int read_u32_le_file(FILE *f, uint32_t *v) {
-    uint8_t b[4];
-    if (fread(b, 1, sizeof(b), f) != sizeof(b)) {
-        return 0;
+static void poly_block(poly_ctx *p, const uint8_t b[16], uint32_t hibit) {
+    uint64_t d[5] = {0};
+    uint32_t carry;
+    p->h[0] += load_le32(b) & 0x3ffffffu;
+    p->h[1] += (load_le32(b+3) >> 2) & 0x3ffffffu;
+    p->h[2] += (load_le32(b+6) >> 4) & 0x3ffffffu;
+    p->h[3] += (load_le32(b+9) >> 6) & 0x3ffffffu;
+    p->h[4] += (load_le32(b+12) >> 8) | hibit;
+    for (size_t i=0; i<5; ++i) {
+        for (size_t j=0; j<5; ++j) {
+            size_t k = (i + 5 - j) % 5;
+            d[i] += (uint64_t)p->h[j] * p->r[k] * (j > i ? 5u : 1u);
+        }
     }
-    *v = load_le32(b);
-    return 1;
+    for (size_t i=0; i<4; ++i) {
+        p->h[i] = (uint32_t)d[i] & 0x3ffffffu;
+        d[i+1] += d[i] >> 26;
+    }
+    p->h[4] = (uint32_t)d[4] & 0x3ffffffu;
+    carry = (uint32_t)(d[4] >> 26);
+    p->h[0] += carry * 5;
+    carry = p->h[0] >> 26;
+    p->h[0] &= 0x3ffffffu;
+    p->h[1] += carry;
+    SECURE_ZERO(d, sizeof(d));
+}
+static void poly_update(poly_ctx *p, const uint8_t *data, size_t n) {
+    while (n) {
+        size_t take = 16 - p->used;
+        if (take > n) take = n;
+        memcpy(p->buffer+p->used, data, take);
+        data += take; n -= take; p->used += take;
+        if (p->used == 16) {
+            poly_block(p, p->buffer, 1u << 24);
+            p->used = 0;
+        }
+    }
+}
+static void poly_final(poly_ctx *p, uint8_t tag[16]) {
+    uint32_t g[5], words[4], carry, mask;
+    uint64_t f;
+    if (p->used) {
+        p->buffer[p->used++] = 1;
+        memset(p->buffer+p->used, 0, 16-p->used);
+        poly_block(p, p->buffer, 0);
+    }
+    for (size_t i=1; i<4; ++i) {
+        carry=p->h[i]>>26; p->h[i]&=0x3ffffffu; p->h[i+1]+=carry;
+    }
+    carry=p->h[4]>>26; p->h[4]&=0x3ffffffu; p->h[0]+=carry*5;
+    carry=p->h[0]>>26; p->h[0]&=0x3ffffffu; p->h[1]+=carry;
+    g[0]=p->h[0]+5; carry=g[0]>>26; g[0]&=0x3ffffffu;
+    for (size_t i=1; i<4; ++i) {
+        g[i]=p->h[i]+carry; carry=g[i]>>26; g[i]&=0x3ffffffu;
+    }
+    g[4]=p->h[4]+carry-(1u<<26);
+    mask=(g[4]>>31)-1u;
+    for (size_t i=0; i<5; ++i) p->h[i]=(p->h[i]&~mask)|(g[i]&mask);
+    words[0]=p->h[0]|(p->h[1]<<26);
+    words[1]=(p->h[1]>>6)|(p->h[2]<<20);
+    words[2]=(p->h[2]>>12)|(p->h[3]<<14);
+    words[3]=(p->h[3]>>18)|(p->h[4]<<8);
+    f=0;
+    for (size_t i=0; i<4; ++i) {
+        f=(uint64_t)words[i]+p->pad[i]+(f>>32);
+        store_le32(tag+4*i, (uint32_t)f);
+    }
+    SECURE_ZERO(g, sizeof(g)); SECURE_ZERO(words, sizeof(words));
+    SECURE_ZERO(p, sizeof(*p));
+}
+static void store_le64(uint8_t out[8], uint64_t x) {
+    for (size_t i=0; i<8; ++i) out[i]=(uint8_t)(x>>(8*i));
+}
+static void poly_pad(poly_ctx *p, uint64_t n) {
+    static const uint8_t zeros[16]={0};
+    if (n%16) poly_update(p, zeros, (size_t)(16-n%16));
+}
+static void aead_begin(poly_ctx *p, const uint8_t key[32],
+                       const uint8_t nonce[12], const uint8_t *aad, size_t n) {
+    uint8_t block[64];
+    chacha20_block(key, 0, nonce, block);
+    poly_init(p, block);
+    SECURE_ZERO(block, sizeof(block));
+    poly_update(p, aad, n);
+    poly_pad(p, n);
+}
+static void aead_end(poly_ctx *p, uint64_t aadlen, uint64_t clen, uint8_t tag[16]) {
+    uint8_t lengths[16];
+    poly_pad(p, clen);
+    store_le64(lengths, aadlen); store_le64(lengths+8, clen);
+    poly_update(p, lengths, sizeof(lengths)); poly_final(p, tag);
 }
 
-/* Serializa/deserializa cabecalho JMS2. */
-
-static int write_header(FILE *f, const jms_header_t *h) {
-    if (fwrite(h->magic, 1, sizeof(h->magic), f) != sizeof(h->magic)) return 0;
-    if (fwrite(&h->version, 1, 1, f) != 1) return 0;
-    if (fwrite(h->salt, 1, JMS_SALT_SIZE, f) != JMS_SALT_SIZE) return 0;
-    if (fwrite(h->nonce, 1, JMS_NONCE_SIZE, f) != JMS_NONCE_SIZE) return 0;
-    if (!write_u32_le_file(f, h->iterations)) return 0;
-    if (fwrite(h->mac, 1, JMS_MAC_SIZE, f) != JMS_MAC_SIZE) return 0;
-    return 1;
+/* OS adapters. /dev/urandom is the OS CSPRNG, never a userland fallback. */
+static int secure_random_bytes(uint8_t *out, size_t n) {
+    int fd=open("/dev/urandom", O_RDONLY);
+    if (fd<0) return 0;
+    while (n) {
+        ssize_t got=read(fd, out, n);
+        if (got<0 && errno==EINTR) continue;
+        if (got<=0) { close(fd); return 0; }
+        out+=(size_t)got; n-=(size_t)got;
+    }
+    return close(fd)==0;
+}
+static volatile sig_atomic_t password_signal;
+static void password_handler(int sig) { password_signal=sig; }
+static int read_password(const char *prompt, uint8_t out[JMS_PASSWORD_SIZE], size_t *len) {
+    static const int signals[]={SIGINT,SIGTERM,SIGHUP,SIGQUIT,SIGTSTP};
+    struct sigaction old[5], action;
+    struct termios before, hidden;
+    int fd=-1, ok=0, changed=0;
+    size_t installed=0, n=0;
+    uint8_t c=0;
+    *len=0;
+    memset(out, 0, JMS_PASSWORD_SIZE);
+    fd=open("/dev/tty", O_RDWR);
+    if (fd<0 || tcgetattr(fd, &before)!=0) goto done;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler=password_handler; sigemptyset(&action.sa_mask);
+    password_signal=0;
+    for (; installed<5; ++installed)
+        if (sigaction(signals[installed], &action, &old[installed])!=0) goto done;
+    hidden=before;
+    hidden.c_lflag &= (tcflag_t)~(ECHO|ECHONL);
+    hidden.c_lflag |= ICANON;
+    if (tcsetattr(fd, TCSAFLUSH, &hidden)!=0) goto done;
+    changed=1;
+    if (write(fd, prompt, strlen(prompt))!=(ssize_t)strlen(prompt)) goto done;
+    while (!password_signal) {
+        ssize_t got=read(fd, &c, 1);
+        if (got!=1) break;
+        if (c=='\n') { ok=(n>0); break; }
+        if (c==0 || n>=JMS_PASSWORD_SIZE-1) break;
+        out[n++]=c;
+    }
+done:
+    if (changed) {
+        int restored;
+        do { restored=tcsetattr(fd, TCSAFLUSH, &before); } while (restored<0 && errno==EINTR);
+        if (restored<0) ok=0;
+        if (write(fd, "\n", 1)!=1) ok=0;
+    }
+    for (size_t i=0; i<installed; ++i) (void)sigaction(signals[i], &old[i], NULL);
+    if (fd>=0) close(fd);
+    SECURE_ZERO(&c, sizeof(c));
+    if (password_signal) ok=0;
+    if (!ok) SECURE_ZERO(out, JMS_PASSWORD_SIZE);
+    else *len=n;
+    return ok;
 }
 
-static int read_header(FILE *f, jms_header_t *h) {
-    if (fread(h->magic, 1, sizeof(h->magic), f) != sizeof(h->magic)) return 0;
-    if (fread(&h->version, 1, 1, f) != 1) return 0;
-    if (fread(h->salt, 1, JMS_SALT_SIZE, f) != JMS_SALT_SIZE) return 0;
-    if (fread(h->nonce, 1, JMS_NONCE_SIZE, f) != JMS_NONCE_SIZE) return 0;
-    if (!read_u32_le_file(f, &h->iterations)) return 0;
-    if (fread(h->mac, 1, JMS_MAC_SIZE, f) != JMS_MAC_SIZE) return 0;
-    return 1;
+/* Serialization: 0 magic JMS3; 4 version=1; 5 KDF=1; 6 AEAD=1; 7 flags=0;
+ * 8 salt[16]; 24 nonce[12]; 36 iterations LE32; 40 tag[16]; 56 ciphertext.
+ * Bytes 0..39 are AAD. Tag covers AAD, ciphertext and their RFC 8439 lengths. */
+static int valid_header(const uint8_t h[JMS_HEADER_SIZE]) {
+    uint32_t n=load_le32(h+36);
+    return !memcmp(h,"JMS3",4) && h[4]==1 && h[5]==1 && h[6]==1 && h[7]==0
+        && n>=JMS_MIN_ITERATIONS && n<=JMS_MAX_ITERATIONS;
+}
+/* A destination temp is on the same filesystem; link publishes without
+ * overwriting even if another process creates the destination meanwhile.
+ * Parent directory must be trusted. Crash durability of directory entries is
+ * not guaranteed (no directory fsync / macOS F_FULLFSYNC). */
+static FILE *output_temp(const char *dest, char **name) {
+    size_t n=strlen(dest);
+    int fd;
+    FILE *f;
+    if (n>SIZE_MAX-12) return NULL;
+    *name=malloc(n+12);
+    if (!*name) return NULL;
+    memcpy(*name,dest,n); memcpy(*name+n,".tmp.XXXXXX",12);
+    fd=mkstemp(*name); /* mode 0600 */
+    if (fd<0) { free(*name); *name=NULL; return NULL; }
+    f=fdopen(fd,"w+b");
+    if (!f) { close(fd); unlink(*name); free(*name); *name=NULL; }
+    return f;
 }
 
-/*
- * Alimenta no HMAC apenas os campos autenticados do cabecalho,
- * excluindo o proprio campo mac.
- */
-
-static void hmac_update_header_fields(hmac_sha256_ctx_t *hmac, const jms_header_t *h) {
-    hmac_sha256_update(hmac, h->magic, sizeof(h->magic));
-    hmac_sha256_update(hmac, &h->version, 1);
-    hmac_sha256_update(hmac, h->salt, JMS_SALT_SIZE);
-    hmac_sha256_update(hmac, h->nonce, JMS_NONCE_SIZE);
-
-    uint8_t iter[4];
-    store_le32(iter, h->iterations);
-    hmac_sha256_update(hmac, iter, sizeof(iter));
-}
-
-/* Tamanho fixo do cabecalho JMS2 em bytes. */
-
-static long header_size_bytes(void) {
-    return 4L + 1L + (long)JMS_SALT_SIZE + (long)JMS_NONCE_SIZE + 4L + (long)JMS_MAC_SIZE;
-}
-
-/*
- * Fluxo de criptografia com limpeza segura de memoria.
- */
-
-static int encrypt_file(FILE *in, FILE *out, const char *password) {
-    jms_header_t header;
-    uint8_t master_key[32] = {0};
-    uint8_t enc_key[32] = {0};
-    uint8_t mac_key[32] = {0};
-    hmac_sha256_ctx_t hmac;
-    chacha20_ctx_t chacha;
+/* Shared engine called by the CLI and by the external benchmark harness.
+ * Decryption first copies and authenticates ciphertext into an unlinked 0600
+ * snapshot. The second pass decrypts that exact snapshot, closing the input
+ * modification race of naive two-pass schemes. No plaintext before tag check.
+ * This adds disk I/O and up to one ciphertext-sized temporary file. */
+static int process_file(int decrypt, const char *src, const char *dest,
+                        const uint8_t *password, size_t plen, uint32_t iterations) {
+    FILE *in=NULL, *out=NULL, *snapshot=NULL;
+    char *tmpname=NULL;
+    struct stat st;
+    uint8_t h[JMS_HEADER_SIZE]={0}, key[32]={0}, tag[16]={0};
     uint8_t buffer[JMS_BUFFER_SIZE];
-    int status_ret = 0; /* 0 indica erro por defeito */
-
-    memcpy(header.magic, JMS_MAGIC, sizeof(header.magic));
-    header.version = (uint8_t)JMS_VERSION;
-    header.iterations = JMS_KDF_ITERATIONS;
-    memset(header.mac, 0, JMS_MAC_SIZE);
-
-    if (!secure_random_bytes(header.salt, JMS_SALT_SIZE) || !secure_random_bytes(header.nonce, JMS_NONCE_SIZE)) {
-        printf("Erro ao gerar aleatoriedade segura.\n");
-        goto cleanup;
+    chacha20_ctx_t cipher;
+    poly_ctx poly;
+    uint64_t total=0;
+    size_t n;
+    int ok=0, fd=-1;
+    const char *error="Falha de entrada/saida";
+    memset(&cipher,0,sizeof(cipher)); memset(&poly,0,sizeof(poly));
+    if (!plen || plen>=JMS_PASSWORD_SIZE) { error="Senha invalida"; goto done; }
+    if (lstat(dest,&st)==0 || errno!=ENOENT) { error="Destino ja existe ou inacessivel"; goto done; }
+    fd=open(src,O_RDONLY|O_NONBLOCK);
+    if (fd<0) goto done;
+    if (fstat(fd,&st)!=0 || !S_ISREG(st.st_mode) || st.st_size<0) {
+        error="Entrada deve ser arquivo regular"; goto done;
     }
-
-    derive_master_key(password, header.salt, header.iterations, master_key);
-    derive_subkey(master_key, "JMS-ENC", enc_key);
-    derive_subkey(master_key, "JMS-MAC", mac_key);
-
-    if (!write_header(out, &header)) {
-        printf("Erro ao escrever arquivo de saida.\n");
-        goto cleanup;
+    if ((uint64_t)st.st_size > JMS_MAX_BYTES+(decrypt?JMS_HEADER_SIZE:0u)) {
+        error="Arquivo excede limite do formato"; goto done;
     }
-
-    hmac_sha256_init(&hmac, mac_key, sizeof(mac_key));
-    hmac_update_header_fields(&hmac, &header);
-
-    chacha20_init(&chacha, enc_key, header.nonce);
-
-    while (!feof(in)) {
-        size_t n = fread(buffer, 1, sizeof(buffer), in);
-        if (ferror(in)) {
-            printf("Erro ao ler arquivo de entrada.\n");
-            goto cleanup;
+    in=fdopen(fd,"rb");
+    if (!in) goto done;
+    fd=-1;
+    if (decrypt) {
+        if (fread(h,1,sizeof(h),in)!=sizeof(h) || !valid_header(h)) {
+            error="Cabecalho invalido ou formato nao suportado"; goto done;
         }
-        if (n == 0) {
-            break;
+        iterations=load_le32(h+36);
+    } else {
+        if (iterations<JMS_MIN_ITERATIONS || iterations>JMS_MAX_ITERATIONS) {
+            error="Iteracoes fora da politica"; goto done;
         }
-
-        chacha20_xor(&chacha, buffer, n);
-        hmac_sha256_update(&hmac, buffer, n);
-
-        if (fwrite(buffer, 1, n, out) != n) {
-            printf("Erro ao escrever arquivo de saida.\n");
-            goto cleanup;
+        memcpy(h,"JMS3",4); h[4]=h[5]=h[6]=1;
+        if (!secure_random_bytes(h+8,28)) { error="Falha no CSPRNG"; goto done; }
+        store_le32(h+36,iterations);
+    }
+    if (!pbkdf2(password,plen,h+8,16,iterations,key)) goto done;
+    aead_begin(&poly,key,h+24,h,JMS_AAD_SIZE);
+    if (decrypt) {
+        /* tmpfile creates an unlinked temporary file; constrain permissions
+         * explicitly before storing even ciphertext. */
+        snapshot=tmpfile();
+        if (!snapshot || fchmod(fileno(snapshot),S_IRUSR|S_IWUSR)!=0) goto done;
+    } else {
+        out=output_temp(dest,&tmpname);
+        if (!out || fwrite(h,1,sizeof(h),out)!=sizeof(h)) goto done;
+        chacha20_init(&cipher,key,h+24);
+    }
+    while ((n=fread(buffer,1,sizeof(buffer),in))!=0) {
+        if ((uint64_t)n>JMS_MAX_BYTES-total) { error="Limite ChaCha20 excedido"; goto done; }
+        total+=n;
+        if (!decrypt) chacha20_xor(&cipher,buffer,n);
+        poly_update(&poly,buffer,n);
+        if (fwrite(buffer,1,n,decrypt?snapshot:out)!=n) goto done;
+    }
+    if (ferror(in)) goto done;
+    aead_end(&poly,JMS_AAD_SIZE,total,tag);
+    if (decrypt) {
+        if (!constant_time_equal(tag,h+40,16)) { error="Autenticacao falhou: senha ou arquivo invalido"; goto done; }
+        if (fflush(snapshot)!=0 || fseeko(snapshot,0,SEEK_SET)!=0) goto done;
+        out=output_temp(dest,&tmpname);
+        if (!out) goto done;
+        chacha20_init(&cipher,key,h+24);
+        while ((n=fread(buffer,1,sizeof(buffer),snapshot))!=0) {
+            chacha20_xor(&cipher,buffer,n);
+            if (fwrite(buffer,1,n,out)!=n) goto done;
         }
+        if (ferror(snapshot)) goto done;
+    } else {
+        if (fseeko(out,40,SEEK_SET)!=0 || fwrite(tag,1,16,out)!=16) goto done;
     }
-
-    hmac_sha256_final(&hmac, header.mac);
-
-    if (fseek(out, 0L, SEEK_SET) != 0) {
-        printf("Erro ao finalizar arquivo de saida.\n");
-        goto cleanup;
-    }
-
-    if (!write_header(out, &header)) {
-        printf("Erro ao finalizar arquivo de saida.\n");
-        goto cleanup;
-    }
-
-    status_ret = 1; /* Sucesso */
-
-cleanup:
-    /* Limpeza de memoria garantida pelo SECURE_ZERO independentemente do resultado */
-    SECURE_ZERO(master_key, sizeof(master_key));
-    SECURE_ZERO(enc_key, sizeof(enc_key));
-    SECURE_ZERO(mac_key, sizeof(mac_key));
-    SECURE_ZERO(&chacha, sizeof(chacha));
-    SECURE_ZERO(&hmac, sizeof(hmac));
-    SECURE_ZERO(buffer, sizeof(buffer));
-
-    return status_ret;
+    if (fflush(out)!=0 || fsync(fileno(out))!=0) goto done;
+    { int rc=fclose(out); out=NULL; if (rc!=0) goto done; }
+    if (link(tmpname,dest)!=0) { error="Nao foi possivel publicar destino (nenhum arquivo sobrescrito)"; goto done; }
+    ok=1;
+done:
+    if (fd>=0) close(fd);
+    if (in) fclose(in);
+    if (out) fclose(out);
+    if (snapshot) fclose(snapshot);
+    if (tmpname) { unlink(tmpname); free(tmpname); }
+    SECURE_ZERO(key,sizeof(key)); SECURE_ZERO(buffer,sizeof(buffer));
+    SECURE_ZERO(&cipher,sizeof(cipher)); SECURE_ZERO(&poly,sizeof(poly));
+    SECURE_ZERO(tag,sizeof(tag));
+    if (!ok) fprintf(stderr,"JMS: %s.\n",error);
+    return ok;
 }
 
-/*
- * Fluxo de descriptografia com limpeza segura de memoria.
- */
-
-static int decrypt_file(FILE *in, FILE *out, const char *password) {
-    jms_header_t header;
-    uint8_t master_key[32] = {0};
-    uint8_t enc_key[32] = {0};
-    uint8_t mac_key[32] = {0};
-    uint8_t computed_mac[32] = {0};
-    hmac_sha256_ctx_t hmac;
-    chacha20_ctx_t chacha;
-    uint8_t buffer[JMS_BUFFER_SIZE];
-    long data_start;
-    int status_ret = 0; /* 0 indica erro por defeito */
-
-    if (!read_header(in, &header)) {
-        printf("Arquivo invalido ou corrompido.\n");
-        goto cleanup;
-    }
-
-    if (memcmp(header.magic, JMS_MAGIC, sizeof(header.magic)) != 0) {
-        printf("Formato de arquivo invalido.\n");
-        goto cleanup;
-    }
-
-    if (header.version != JMS_VERSION) {
-        printf("Versao de arquivo nao suportada.\n");
-        goto cleanup;
-    }
-
-    if (header.iterations < 1000u || header.iterations > 10000000u) {
-        printf("Cabecalho invalido.\n");
-        goto cleanup;
-    }
-
-    derive_master_key(password, header.salt, header.iterations, master_key);
-    derive_subkey(master_key, "JMS-ENC", enc_key);
-    derive_subkey(master_key, "JMS-MAC", mac_key);
-
-    hmac_sha256_init(&hmac, mac_key, sizeof(mac_key));
-    hmac_update_header_fields(&hmac, &header);
-
-    while (!feof(in)) {
-        size_t n = fread(buffer, 1, sizeof(buffer), in);
-        if (ferror(in)) {
-            printf("Erro ao ler arquivo de entrada.\n");
-            goto cleanup;
-        }
-        if (n == 0) {
-            break;
-        }
-        hmac_sha256_update(&hmac, buffer, n);
-    }
-
-    hmac_sha256_final(&hmac, computed_mac);
-
-    if (!constant_time_equal(computed_mac, header.mac, JMS_MAC_SIZE)) {
-        printf("Chave incorreta ou arquivo adulterado.\n");
-        goto cleanup;
-    }
-
-    data_start = header_size_bytes();
-    if (fseek(in, data_start, SEEK_SET) != 0) {
-        printf("Erro ao reposicionar leitura.\n");
-        goto cleanup;
-    }
-
-    chacha20_init(&chacha, enc_key, header.nonce);
-
-    while (!feof(in)) {
-        size_t n = fread(buffer, 1, sizeof(buffer), in);
-        if (ferror(in)) {
-            printf("Erro ao ler arquivo de entrada.\n");
-            goto cleanup;
-        }
-        if (n == 0) {
-            break;
-        }
-
-        chacha20_xor(&chacha, buffer, n);
-        if (fwrite(buffer, 1, n, out) != n) {
-            printf("Erro ao escrever arquivo de saida.\n");
-            goto cleanup;
-        }
-    }
-
-    status_ret = 1; /* Sucesso */
-
-cleanup:
-    /* Limpeza de memoria garantida pelo SECURE_ZERO independentemente do resultado */
-    SECURE_ZERO(master_key, sizeof(master_key));
-    SECURE_ZERO(enc_key, sizeof(enc_key));
-    SECURE_ZERO(mac_key, sizeof(mac_key));
-    SECURE_ZERO(computed_mac, sizeof(computed_mac));
-    SECURE_ZERO(&chacha, sizeof(chacha));
-    SECURE_ZERO(&hmac, sizeof(hmac));
-    SECURE_ZERO(buffer, sizeof(buffer));
-
-    return status_ret;
+/* Known-answer vectors: SHA-256 abc; RFC 4231 case 1; PBKDF2-SHA256
+ * password/salt c=1; RFC 8439 2.3.2, 2.5.2 and 2.8.2. */
+static int equals_hex(const uint8_t *data, size_t n, const char *hex) {
+    static const char digits[]="0123456789abcdef";
+    if (strlen(hex)!=2*n) return 0;
+    for (size_t i=0; i<n; ++i)
+        if (digits[data[i]>>4]!=hex[2*i] || digits[data[i]&15]!=hex[2*i+1]) return 0;
+    return 1;
 }
-
-/*
- * main:
- * - Faz parse dos argumentos.
- * - Abre arquivos de entrada/saida.
- * - Executa criptografia (-c) ou descriptografia (-d).
- * - Em falha, remove arquivo de saida parcial.
- */
-
-int main(int argc, char *argv[]) {
-
-    char *input = NULL;
-    char *output = NULL;
-    char *key_str = NULL;
-
-    int mode_encrypt = 0;
-    int mode_decrypt = 0;
-    int exec_status = 1;
-
-    for (int i = 1; i < argc; i++) {
-
-        if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
-            input = argv[++i];
-        }
-        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
-            output = argv[++i];
-        }
-        else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            key_str = argv[++i];
-            mode_encrypt = 1;
-        }
-        else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
-            key_str = argv[++i];
-            mode_decrypt = 1;
+static int self_test(void) {
+    uint8_t out[128], key[32], nonce[12]={0}, tag[16];
+    const uint8_t pk[32]={0x85,0xd6,0xbe,0x78,0x57,0x55,0x6d,0x33,
+        0x7f,0x44,0x52,0xfe,0x42,0xd5,0x06,0xa8,0x01,0x03,0x80,0x8a,
+        0xfb,0x0d,0xb2,0xfd,0x4a,0xbf,0xf6,0xaf,0x41,0x49,0xf5,0x1b};
+    const uint8_t aad[12]={0x50,0x51,0x52,0x53,0xc0,0xc1,0xc2,0xc3,0xc4,0xc5,0xc6,0xc7};
+    const char *plain="Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+    poly_ctx p;
+    chacha20_ctx_t c;
+    hmac_sha256_ctx_t hm;
+    int ok=1;
+    sha256_once((const uint8_t *)"abc",3,out);
+    ok &= equals_hex(out,32,"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    memset(key,0x0b,20); hmac_sha256_init(&hm,key,20);
+    hmac_sha256_update(&hm,(const uint8_t *)"Hi There",8); hmac_sha256_final(&hm,out);
+    ok &= equals_hex(out,32,"b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    pbkdf2((const uint8_t *)"password",8,(const uint8_t *)"salt",4,1,out);
+    ok &= equals_hex(out,32,"120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+    for (size_t i=0; i<32; ++i) key[i]=(uint8_t)i;
+    nonce[3]=9; nonce[7]=0x4a;
+    chacha20_block(key,1,nonce,out);
+    ok &= equals_hex(out,64,"10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e"
+        "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e");
+    poly_init(&p,pk); poly_update(&p,(const uint8_t *)"Cryptographic Forum Research Group",34);
+    poly_final(&p,tag); ok &= equals_hex(tag,16,"a8061dc1305136c6c22b8baf0c0127a9");
+    for (size_t i=0; i<32; ++i) key[i]=(uint8_t)(0x80+i);
+    memset(nonce,0,12); nonce[0]=7;
+    for (size_t i=4; i<12; ++i) nonce[i]=(uint8_t)(0x40+i-4);
+    memcpy(out,plain,114); chacha20_init(&c,key,nonce); chacha20_xor(&c,out,114);
+    ok &= equals_hex(out,114,"d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63"
+        "dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692"
+        "ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4"
+        "def08e4b7a9de576d26586cec64b6116");
+    aead_begin(&p,key,nonce,aad,12); poly_update(&p,out,114); aead_end(&p,12,114,tag);
+    ok &= equals_hex(tag,16,"1ae10b594f09e26a7e902ecbd0600691");
+    SECURE_ZERO(out,sizeof(out)); SECURE_ZERO(key,sizeof(key)); SECURE_ZERO(&c,sizeof(c));
+    puts(ok?"Self-test: OK (6 known-answer checks)":"Self-test: FAILED");
+    return ok;
+}
+static void usage(void) {
+    puts("JMS 3.0 — C99/POSIX, PBKDF2-SHA256 + ChaCha20-Poly1305\n"
+         "  jms -e -f entrada -o saida.jms\n"
+         "  jms -d -f entrada.jms -o saida\n"
+         "  jms --self-test | -h | -v\n"
+         "Senha: terminal sem eco, 1..255 bytes. Destino deve nao existir.\n"
+         "Formato JMS3; arquivos JMS2 nao sao suportados.");
+}
+int main(int argc, char **argv) {
+    const char *src=NULL, *dest=NULL;
+    uint8_t password[JMS_PASSWORD_SIZE]={0}, confirm[JMS_PASSWORD_SIZE]={0};
+    size_t plen=0, clen=0;
+    int mode=-1, ok=0;
+    if (argc==2 && !strcmp(argv[1],"--self-test")) return self_test()?0:1;
+    if (argc==2 && !strcmp(argv[1],"-v")) { puts("JMS 3.0 / format JMS3 v1"); return 0; }
+    if (argc==2 && !strcmp(argv[1],"-h")) { usage(); return 0; }
+    for (int i=1; i<argc; ++i) {
+        if (!strcmp(argv[i],"-e") && mode<0) mode=0;
+        else if (!strcmp(argv[i],"-d") && mode<0) mode=1;
+        else if (!strcmp(argv[i],"-f") && !src && i+1<argc) src=argv[++i];
+        else if (!strcmp(argv[i],"-o") && !dest && i+1<argc) dest=argv[++i];
+        else { usage(); return 2; }
+    }
+    if (mode<0 || !src || !dest) { usage(); return 2; }
+    if (!read_password("Senha: ",password,&plen)) goto done;
+    if (!mode) {
+        if (!read_password("Confirme: ",confirm,&clen)) goto done;
+        if (plen!=clen || !constant_time_equal(password,confirm,JMS_PASSWORD_SIZE)) {
+            fputs("Senhas diferentes.\n",stderr); goto done;
         }
     }
-
-    if (!input || !output || !key_str || (mode_encrypt == mode_decrypt)) {
-        printf("Uso:\n");
-        printf("  Criptografar:   jms -f entrada -c chave -o saida\n");
-        printf("  Descriptografar: jms -f entrada -d chave -o saida\n");
-        return 1;
-    }
-
-    FILE *in = fopen(input, "rb");
-
-    if (!in) {
-        printf("Erro ao abrir arquivos.\n");
-        /* O key_str contem a password da linha de comandos, vamos limpar */
-        if (key_str) SECURE_ZERO(key_str, strlen(key_str));
-        return 1;
-    }
-
-    if (mode_encrypt) {
-        FILE *out = fopen(output, "wb");
-        if (!out) {
-            fclose(in);
-            printf("Erro ao abrir arquivos.\n");
-            if (key_str) SECURE_ZERO(key_str, strlen(key_str));
-            return 1;
-        }
-
-        if (!encrypt_file(in, out, key_str)) {
-            fclose(in);
-            fclose(out);
-            remove(output);
-            if (key_str) SECURE_ZERO(key_str, strlen(key_str));
-            return 1;
-        }
-
-        fclose(in);
-        fclose(out);
-        printf("Arquivo criptografado com sucesso!\n");
-        if (key_str) SECURE_ZERO(key_str, strlen(key_str));
-        return 0;
-    }
-
-    FILE *out = fopen(output, "wb");
-    if (!out) {
-        fclose(in);
-        printf("Erro ao abrir arquivos.\n");
-        if (key_str) SECURE_ZERO(key_str, strlen(key_str));
-        return 1;
-    }
-
-    if (!decrypt_file(in, out, key_str)) {
-        fclose(in);
-        fclose(out);
-        remove(output);
-        if (key_str) SECURE_ZERO(key_str, strlen(key_str));
-        return 1;
-    }
-
-    fclose(in);
-    fclose(out);
-
-    printf("Arquivo descriptografado com sucesso!\n");
-    if (key_str) SECURE_ZERO(key_str, strlen(key_str));
-
+    SECURE_ZERO(confirm,sizeof(confirm));
+    ok=process_file(mode,src,dest,password,plen,JMS_DEFAULT_ITERATIONS);
+done:
+    SECURE_ZERO(password,sizeof(password)); SECURE_ZERO(confirm,sizeof(confirm));
+    if (!ok) { fputs("Operacao nao concluida.\n",stderr); return 1; }
+    puts("Operacao concluida.");
     return 0;
 }
